@@ -1,6 +1,8 @@
-# Control Viewer
+# Control Chart Viewer
 
 A modern web application for viewing and controlling industrial control systems. This project is built using NiceGUI for the frontend and FastAPI for the backend.
+
+Nothing works, I know, pull requests rejected.  Thanks in advance, be nice to each other.
 
 ![Control Viewer Dashboard](https://raw.githubusercontent.com/YourUsername/control-viewer-nicegui/main/docs/images/dashboard_screenshot.png)
 
