@@ -10,7 +10,7 @@ from models import ControlPoint, ControlGroup, HistoricalData, SystemSettings
 from database import database
 from utils import serialize_to_json, generate_simulated_value, calculate_status
 
-router = APIRouter(prefix="/api")
+router = APIRouter()
 
 # WebSocket connection manager
 class ConnectionManager:

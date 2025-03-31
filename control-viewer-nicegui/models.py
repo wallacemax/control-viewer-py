@@ -10,6 +10,8 @@ class PointType(str, Enum):
     """Type of control point"""
     SENSOR = "sensor"
     ACTUATOR = "actuator"
+    SCALE = "scale"
+    SOME_SCALE_NAME = "{SOME_SCALE_NAME}"
 
 class PointStatus(str, Enum):
     """Status of a control point"""
@@ -29,8 +31,8 @@ class ControlPoint(BaseModel):
     min_value: Optional[float] = None
     max_value: Optional[float] = None
     timestamp: Optional[datetime] = None
-    status: PointStatus = PointStatus.UNKNOWN
-    type: PointType = PointType.SENSOR
+    status: PointStatus
+    type: PointType 
     
     class Config:
         use_enum_values = True

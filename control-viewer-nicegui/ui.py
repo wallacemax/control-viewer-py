@@ -11,9 +11,11 @@ from models import ControlPoint, ControlGroup, SystemSettings, PointStatus
 import httpx
 import websockets
 
+import time
+
 from config import settings
 
-API_BASE_URL = f'http://{settings.HOST}:{settings.PORT}'
+API_BASE_URL = f'http://{settings.HOST}:{settings.PORT}/api'
 
 # Singleton for storing page components that need to be accessed across functions
 class UIState:
@@ -25,6 +27,16 @@ class UIState:
         self.selected_points_for_trend = set()
         self.trend_data = {}
         self.on_refresh_callback = None
+                
+        # Add these to store important container references
+        self.selected_points_list = None
+        self.chart_container = None
+        self.settings_form = None
+        self.table_container = None
+
+        #debounce
+        self.last_refresh_time = 0
+        self.refresh_cooldown = 10
 
 # Create singleton instance
 ui_state = UIState()
@@ -37,11 +49,20 @@ def format_timestamp(timestamp):
     
     if isinstance(timestamp, str):
         try:
-            timestamp = datetime.fromisoformat(timestamp)
+            # Parse the ISO format string into a datetime object
+            timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            # Remove timezone info to make it naive
+            timestamp = timestamp.replace(tzinfo=None)
         except ValueError:
             return timestamp
     
+    # Make sure both datetimes are naive or both are aware
     now = datetime.now()
+    
+    # If timestamp has timezone but now doesn't, remove timezone
+    if hasattr(timestamp, 'tzinfo') and timestamp.tzinfo is not None:
+        timestamp = timestamp.replace(tzinfo=None)
+    
     delta = now - timestamp
     
     if delta < timedelta(minutes=1):
@@ -81,22 +102,21 @@ def create_dashboard():
 
 async def refresh_dashboard():
     """Refresh the dashboard with current data"""
-    if ui_state.control_cards:
-        ui_state.control_cards.clear()
+    # Check refresh cooldown
+    current_time = time.time()
+    if current_time - ui_state.last_refresh_time < ui_state.refresh_cooldown:
+        return
+    
+    ui_state.last_refresh_time = current_time
     
     try:
+        # Fetch points from API
         async with httpx.AsyncClient() as client:
-            response = await client.get(f'{API_BASE_URL}/api/control-points')
+            response = await client.get(f'{API_BASE_URL}/control-points')
         
-        # Print the raw response content first
-        print(f"Response status: {response.status_code}")
-        print(f"Response headers: {response.headers}")
-        print(f"Raw response content: {response.text}")
-        
-        # Only try to parse JSON if content exists and is application/json
+        # Only process if we got a valid JSON response
         if response.text and ('application/json' in response.headers.get('content-type', '')):
             points = response.json()
-            print(f"API Response type: {type(points)}, Content: {points}")
             
             # Add type checking and error handling
             if not isinstance(points, list):
@@ -106,21 +126,70 @@ async def refresh_dashboard():
                     print(f"Unexpected API response format: {points}")
                     points = []  # Default to empty list to prevent errors
             
-            ui_state.points_by_id = {point['id']: point for point in points}
+            # Create dictionary of new points by ID
+            new_points_by_id = {point['id']: point for point in points}
             
-            if not points:
+            # Create a dictionary to keep track of card elements by point ID
+            if not hasattr(ui_state, 'card_elements'):
+                ui_state.card_elements = {}
+            
+            # Handle case where there are no points
+            if not points and ui_state.control_cards:
+                ui_state.control_cards.clear()
                 with ui_state.control_cards:
                     ui.label('No control points available. Add some in the Configuration tab.')
                     ui.button('Add Sample Data', on_click=add_sample_data).props('color=primary')
-            else:
-                for point in points:
-                    create_control_card(point)
+                ui_state.card_elements = {}
+                ui_state.points_by_id = {}
+                return
+            
+            # Find points to remove (in current state but not in new data)
+            points_to_remove = set(ui_state.points_by_id.keys()) - set(new_points_by_id.keys())
+            for point_id in points_to_remove:
+                if point_id in ui_state.card_elements:
+                    ui_state.card_elements[point_id].delete()
+                    del ui_state.card_elements[point_id]
+            
+            # Update or add points
+            for point_id, point in new_points_by_id.items():
+                old_point = ui_state.points_by_id.get(point_id)
+                
+                # Check if point is new or has changed
+                is_new = point_id not in ui_state.points_by_id
+                has_changed = not is_new and (
+                    point.get('value') != old_point.get('value') or
+                    point.get('status') != old_point.get('status') or
+                    point.get('timestamp') != old_point.get('timestamp')
+                )
+                
+                if is_new:
+                    # Create new card for this point
+                    if ui_state.control_cards:
+                        with ui_state.control_cards:
+                            ui_state.card_elements[point_id] = create_control_card(point)
+                
+                elif has_changed:
+                    # Update existing card
+                    if point_id in ui_state.card_elements:
+                        # Remove old card
+                        ui_state.card_elements[point_id].delete()
+                        
+                        # Create updated card
+                        with ui_state.control_cards:
+                            ui_state.card_elements[point_id] = create_control_card(point)
+            
+            # Update points_by_id with the latest data
+            ui_state.points_by_id = new_points_by_id
+            
         else:
             print("Response is not JSON or is empty")
-            with ui_state.control_cards:
-                ui.label('API returned invalid or empty response').classes('text-negative')
-                ui.button('Retry', on_click=refresh_dashboard).props('color=primary')
+            if ui_state.control_cards:
+                ui_state.control_cards.clear()
+                with ui_state.control_cards:
+                    ui.label('API returned invalid or empty response').classes('text-negative')
+                    ui.button('Retry', on_click=refresh_dashboard).props('color=primary')
         
+        # Call the refresh callback if needed
         if ui_state.on_refresh_callback:
             await ui_state.on_refresh_callback()
             
@@ -131,77 +200,78 @@ async def refresh_dashboard():
         ui.notify(f'Error refreshing dashboard: {str(e)}', type='negative')
         
         # Fallback UI when API call fails
-        with ui_state.control_cards:
-            ui.label('Error loading control points. API may not be available.').classes('text-negative')
-            ui.button('Retry', on_click=refresh_dashboard).props('color=primary')
+        if ui_state.control_cards:
+            ui_state.control_cards.clear()
+            with ui_state.control_cards:
+                ui.label('Error loading control points. API may not be available.').classes('text-negative')
+                ui.button('Retry', on_click=refresh_dashboard).props('color=primary')
 
 def create_control_card(point: Dict[str, Any]):
-    """Create a card for a control point"""
     point_id = point['id']
-    point_type = point.get('type', 'sensor')
-    status = point.get('status', 'unknown')
+    point_type = point.get('type', 'scale')
+    status = point.get('status')
     
-    with ui_state.control_cards:
-        with ui.card().classes('w-full'):
-            with ui.row().classes('w-full items-center justify-between'):
-                ui.label(point['name']).classes('text-h6')
-                ui.icon('fiber_manual_record', color=get_status_color(status)).tooltip(f'Status: {status.capitalize()}')
+    card = ui.card().classes('w-full')
+    with card:
+        with ui.row().classes('w-full items-center justify-between'):
+            ui.label(point['name']).classes('text-h6')
+            ui.icon('fiber_manual_record', color=get_status_color(status)).tooltip(f'Status: {status.capitalize()}')
+        
+        ui.separator()
             
-            ui.separator()
+        if point.get('description'):
+            ui.label(point['description']).classes('text-caption')
+        
+        with ui.row().classes('w-full items-center justify-between'):
+            value_text = f"{point.get('value', 'N/A')} {point.get('unit', '')}"
             
-            if point.get('description'):
-                ui.label(point['description']).classes('text-caption')
-            
-            with ui.row().classes('w-full items-center justify-between'):
-                value_text = f"{point.get('value', 'N/A')} {point.get('unit', '')}"
-                
-                if point_type == 'sensor':
-                    ui.label(f"Value: {value_text}").classes('text-bold')
-                else:  # actuator
-                    with ui.row().classes('items-center'):
-                        value_input = ui.number(label='Value', value=point.get('value', 0))
-                        
-                        if point.get('min_value') is not None:
-                            value_input.props(f"min={point['min_value']}")
-                        
-                        if point.get('max_value') is not None:
-                            value_input.props(f"max={point['max_value']}")
-                        
-                        ui.button('Set', on_click=lambda v=value_input, pid=point_id: set_point_value(pid, v.value)).props('size=sm')
-            
-            if point.get('min_value') is not None and point.get('max_value') is not None:
-                # Add a slider for range visualization
-                current_value = point.get('value', 0)
-                min_value = point.get('min_value', 0)
-                max_value = point.get('max_value', 100)
-                
-                # Calculate percentage for progress bar
-                if max_value > min_value:
-                    percentage = (current_value - min_value) / (max_value - min_value) * 100
-                    percentage = max(0, min(100, percentage))
-                else:
-                    percentage = 50
-                
-                ui.linear_progress(value=percentage/100).classes('w-full')
-                ui.label(f"Range: {min_value} - {max_value} {point.get('unit', '')}").classes('text-caption')
-            
-            ui.separator()
-            
-            with ui.row().classes('w-full items-center justify-between'):
-                ui.label(f"Updated: {format_timestamp(point.get('timestamp'))}").classes('text-caption')
-                
-                with ui.row().classes('gap-2'):
-                    # Trend button to add/remove from trend view
-                    trend_button = ui.button(icon='show_chart', on_click=lambda pid=point_id: toggle_trend_point(pid))
+            if point_type == 'SCALE':
+                ui.label(f"Value: {value_text}").classes('text-bold')
+            else:  # actuator
+                with ui.row().classes('items-center'):
+                    value_input = ui.number(label='Value', value=point.get('value', 0))
                     
-                    if point_id in ui_state.selected_points_for_trend:
-                        trend_button.props('color=primary')
+                    if point.get('min_value') is not None:
+                        value_input.props(f"min={point['min_value']}")
                     
-                    # Edit button
-                    ui.button(icon='edit', on_click=lambda pid=point_id: edit_control_point(pid)).props('flat')
+                    if point.get('max_value') is not None:
+                        value_input.props(f"max={point['max_value']}")
                     
-                    # Delete button
-                    ui.button(icon='delete', on_click=lambda pid=point_id: delete_control_point(pid)).props('flat color=negative')
+                    ui.button('Set', on_click=lambda v=value_input, pid=point_id: set_point_value(pid, v.value)).props('size=sm')
+        
+        if point.get('min_value') is not None and point.get('max_value') is not None:
+            # Add a slider for range visualization
+            current_value = point.get('value', 0)
+            min_value = point.get('min_value', 0)
+            max_value = point.get('max_value', 100)
+            
+            # Calculate percentage for progress bar
+            if max_value > min_value:
+                percentage = (current_value - min_value) / (max_value - min_value) * 100
+                percentage = max(0, min(100, percentage))
+            else:
+                percentage = 50
+            
+            ui.linear_progress(value=percentage/100).classes('w-full')
+            ui.label(f"Range: {min_value} - {max_value} {point.get('unit', '')}").classes('text-caption')
+        
+        ui.separator()
+        
+        with ui.row().classes('w-full items-center justify-between'):
+            ui.label(f"Updated: {format_timestamp(point.get('timestamp'))}").classes('text-caption')
+            
+            with ui.row().classes('gap-2'):
+                # Trend button to add/remove from trend view
+                trend_button = ui.button(icon='show_chart', on_click=lambda pid=point_id: toggle_trend_point(pid))
+                
+                if point_id in ui_state.selected_points_for_trend:
+                    trend_button.props('color=primary')
+                
+                # Edit button
+                ui.button(icon='edit', on_click=lambda pid=point_id: edit_control_point(pid)).props('flat')
+                
+                # Delete button
+                ui.button(icon='delete', on_click=lambda pid=point_id: delete_control_point(pid)).props('flat color=negative')
 
 # Configuration page
 def create_config_page():
@@ -238,7 +308,7 @@ def create_control_points_config():
         point_desc = ui.input('Description')
         
         with ui.row().classes('w-full gap-4 flex-wrap'):
-            point_type = ui.select(['sensor', 'actuator'], label='Type').props('required')
+            point_type = ui.select(['scale', 'actuator'], label='Type').props('required')
             point_unit = ui.input('Unit')
         
         with ui.row().classes('w-full gap-4 flex-wrap'):
@@ -302,7 +372,7 @@ def create_control_points_config():
     ui_state.on_refresh_callback = update_table_data
     
     # Initial data load
-    ui.timer(0.1, update_table_data)
+    ui.timer(0.1, update_table_data, once=True)
 
 def create_groups_config():
     """Create the groups configuration panel"""
@@ -582,7 +652,7 @@ def clear_point_form(id_input, name_input, desc_input, type_input, unit_input, m
         id_input.set_value("")
         name_input.set_value("")
         desc_input.set_value("")
-        type_input.set_value("sensor")
+        type_input.set_value("scale")
         unit_input.set_value("")
         min_input.set_value(None)
         max_input.set_value(None)
@@ -601,7 +671,7 @@ async def edit_control_point(point_id):
             
             edit_name = ui.input('Name', value=point.get('name', ''))
             edit_desc = ui.input('Description', value=point.get('description', ''))
-            edit_type = ui.select(['sensor', 'actuator'], label='Type', value=point.get('type', 'sensor'))
+            edit_type = ui.select(['scale', 'actuator'], label='Type', value=point.get('type', 'scale'))
             edit_unit = ui.input('Unit', value=point.get('unit', ''))
             edit_min = ui.number('Min Value', value=point.get('min_value'))
             edit_max = ui.number('Max Value', value=point.get('max_value'))
@@ -655,7 +725,9 @@ async def save_edited_point(point_id, name, desc, point_type, unit, min_val, max
 async def delete_control_point(point_id):
     """Delete a control point"""
     def confirm_delete():
-        return delete_point_confirmed(point_id)
+        # Use a non-async wrapper
+        app.on_startup(lambda: asyncio.create_task(delete_point_confirmed(point_id)))
+        return None
     
     ui.notify(f"Delete {point_id}?", type="warning", buttons=[
         {'label': 'Cancel', 'color': 'white'},
@@ -745,49 +817,41 @@ async def add_sample_data():
         # Sample control points
         sample_points = [
             {
-                "id": "temp-01",
-                "name": "Temperature Sensor 1",
-                "description": "Main room temperature sensor",
-                "type": "sensor",
-                "value": 23.5,
-                "unit": "°C",
-                "min_value": 0,
-                "max_value": 50,
-                "timestamp": datetime.now().isoformat()
-            },
-            {
-                "id": "press-01",
-                "name": "Pressure Sensor 1",
-                "description": "Main line pressure sensor",
-                "type": "sensor",
-                "value": 275.8,
-                "unit": "kPa",
-                "min_value": 0,
-                "max_value": 1000,
-                "timestamp": datetime.now().isoformat()
-            },
-            {
-                "id": "flow-01",
-                "name": "Flow Sensor 1",
-                "description": "Main line flow sensor",
-                "type": "sensor",
-                "value": 42.3,
-                "unit": "L/min",
-                "min_value": 0,
-                "max_value": 200,
-                "timestamp": datetime.now().isoformat()
-            },
-            {
-                "id": "valve-01",
-                "name": "Control Valve 1",
-                "description": "Main line control valve",
-                "type": "actuator",
-                "value": 75.0,
-                "unit": "%",
-                "min_value": 0,
-                "max_value": 100,
-                "timestamp": datetime.now().isoformat()
-            }
+            "id": "{SOME_SCALE_NAME}-001",
+            "name": "foo2024-09-27T23:27:50.817Z",
+            "description": "This is what I call a target-rich environment.",
+            "value": 42.7,
+            "unit": "gram",
+            "min_value": 0,
+            "max_value": 100,
+            "timestamp": "2024-09-27T23:27:50.817Z",
+            "status": "normal",
+            "type": "{SOME_SCALE_NAME}"
+        },
+        {
+            "id": "{SOME_SCALE_NAME}-002",
+            "name": "foo2024-09-29T19:20:34.453Z",
+            "description": "Every time we go up there, it's unsafe.",
+            "value": 55.4,
+            "unit": "gram",
+            "min_value": 0,
+            "max_value": 100,
+            "timestamp": "2024-09-29T19:20:34.453Z",
+            "status": "normal",
+            "type": "{SOME_SCALE_NAME}"
+        },
+        {
+            "id": "{SOME_SCALE_NAME}-003",
+            "name": "foo2024-10-01T15:13:18.089Z",
+            "description": "That's right! Ice... man. I am dangerous.",
+            "value": 39.5,
+            "unit": "gram",
+            "min_value": 0,
+            "max_value": 100,
+            "timestamp": "2024-10-01T15:13:18.089Z",
+            "status": "normal",
+            "type": "{SOME_SCALE_NAME}"
+        }
         ]
         
         for point in sample_points:
@@ -906,11 +970,12 @@ async def connect_websocket():
             async def listener():
                 while True:
                     try:
-                        message = await ui_state.connected_websocket.receive()
+                        message = await ui_state.connected_websocket.recv()
                         data = json.loads(message)
                         
                         if data.get('action') in ['create', 'update', 'delete', 'simulate']:
-                            await refresh_dashboard()
+                            # Use a JavaScript call to refresh the page instead
+                            await ui.run_javascript('window.location.reload()')
                     except Exception as e:
                         print(f"WebSocket error: {str(e)}")
                         break

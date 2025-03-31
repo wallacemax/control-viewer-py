@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 
 # Set up logging first
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -141,7 +141,7 @@ if __name__ in {"__main__", "__mp_main__"}:
             port=settings.PORT,
             title=settings.APP_NAME,
             dark=False,
-            reload=settings.INFO,
+            reload=settings.DEBUG,
             storage_secret="control-viewer-secret",
             show=True
         )
